@@ -1,0 +1,704 @@
+"""
+================================================================================
+Training Script for CFC-PFM HYBRID MODEL (Closed-Form Continuous-Time)
+================================================================================
+
+Trains the hybrid Closed-Form Continuous-Time Neural Network (CfC)
+with Physics-Informed Motion for multi-agent trajectory prediction.
+
+KEY DIFFERENCE FROM LTC VERSION:
+- Uses CfC implementation with CLOSED-FORM solution (no ODE integration)
+- Follows the Nature ML 2022 paper
+- Much faster than multi-step ODE unfolds while maintaining accuracy
+- Tweakable backbone parameters for different modes
+
+CfC Modes:
+----------
+- "default": Full CfC with sigmoid gating
+- "pure": Simplified without gating mechanism
+- "no_gate": Standard neural network backbone
+
+Architecture:
+-------------
+1. Input: history_neighbors [B, A, ent, H, 2] + goals [B, A, ent, 2]
+2. CfC Encoder: Encodes history with closed-form continuous-time dynamics
+3. PFM Module: Computes physics-based forces (goal, prediction, repulsion)
+4. CfC Decoder: Autoregressive decoding with PFM conditioning
+5. Output: adjusted_preds (physics-corrected) + decoded_preds (raw neural)
+
+References:
+----------
+[1] Hasani et al., "Liquid Time-Constant Networks", AAAI 2021
+[2] Hasani et al., "Closed-form Continuous-time Neural Networks", Nature ML 2022
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+import os
+from tqdm import tqdm
+import json
+import time
+from datetime import datetime
+import numpy as np
+import sys
+
+# Add parent directory for imports (handle both script and notebook environments)
+try:
+    # For regular Python scripts
+    _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+except NameError:
+    # For Jupyter/Kaggle notebooks where __file__ is not defined
+    _BASE_DIR = os.path.abspath('..')
+
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
+
+from datasets.pfm_trajectory_dataset_neighbours import PFM_TrajectoryDataset_neighbours
+from utils.collate_mta_pfm_neighbours import collate_fn
+
+# Import CfC-PFM model (closed-form solution)
+from models.cfc_pfm_hybrid_model import LTC_PFM_HybridModel as CFC_PFM_HybridModel
+
+
+class EarlyStopping:
+    """
+    Early stopping mechanism to prevent overfitting.
+    """
+    def __init__(self, patience=10, min_delta=0.0, verbose=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f"  [EarlyStopping] No improvement: {self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f"  [EarlyStopping] Early stopping triggered!")
+        else:
+            improvement = self.best_loss - val_loss
+            if self.verbose:
+                print(f"  [EarlyStopping] Validation improved by {improvement:.6f}")
+            self.best_loss = val_loss
+            self.counter = 0
+
+
+class MetricsTracker:
+    """Tracks and computes training metrics."""
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.total_loss = 0.0
+        self.total_position_loss = 0.0
+        self.total_coeff_reg = 0.0
+        self.num_batches = 0
+        self.batch_losses = []
+    
+    def update(self, loss, position_loss=0.0, coeff_reg=0.0):
+        self.total_loss += loss
+        self.total_position_loss += position_loss
+        self.total_coeff_reg += coeff_reg
+        self.num_batches += 1
+        self.batch_losses.append(loss)
+    
+    def get_average_loss(self):
+        return self.total_loss / max(self.num_batches, 1)
+    
+    def get_average_position_loss(self):
+        return self.total_position_loss / max(self.num_batches, 1)
+    
+    def get_average_coeff_reg(self):
+        return self.total_coeff_reg / max(self.num_batches, 1)
+    
+    def get_loss_std(self):
+        if len(self.batch_losses) < 2:
+            return 0.0
+        return np.std(self.batch_losses)
+
+
+def compute_ade(predictions, targets):
+    """
+    Compute Average Displacement Error (ADE).
+    ADE = (1/T) * Σ ||pred_t - target_t||₂
+    """
+    displacements = torch.norm(predictions - targets, dim=-1)
+    return displacements.mean()
+
+
+def compute_fde(predictions, targets):
+    """
+    Compute Final Displacement Error (FDE).
+    FDE = ||pred_T - target_T||₂
+    """
+    final_displacements = torch.norm(
+        predictions[..., -1, :] - targets[..., -1, :],
+        dim=-1
+    )
+    return final_displacements.mean()
+
+
+def position_loss(adjusted_preds, decoded_preds, targets, config):
+    """
+    Compute hybrid position loss.
+    
+    Combines:
+    1. MSE on physics-corrected predictions (adjusted_preds)
+    2. MSE on raw neural predictions (decoded_preds) 
+    """
+    # Only use ego agent (index 0) for loss computation
+    adjusted_ego = adjusted_preds[:, :, 0]  # [B, A, T, 2]
+    decoded_ego = decoded_preds[:, :, 0]    # [B, A, T, 2]
+    targets_ego = targets[:, :, 0]          # [B, A, T, 2]
+    
+    # Position loss: Adjusted predictions (physics-corrected)
+    adjusted_loss = F.mse_loss(adjusted_ego, targets_ego)
+    
+    # Auxiliary loss: Raw neural predictions
+    decoded_loss = F.mse_loss(decoded_ego, targets_ego)
+    
+    # Total loss
+    alpha = config.get('loss_alpha', 0.8)
+    loss = alpha * adjusted_loss + (1 - alpha) * decoded_loss
+    
+    loss_dict = {
+        'adjusted_loss': adjusted_loss.item(),
+        'decoded_loss': decoded_loss.item(),
+        'total_loss': loss.item()
+    }
+    
+    return loss, loss_dict
+
+
+def train_one_epoch(model, train_loader, optimizer, device, config, metrics_tracker):
+    """Train model for one epoch."""
+    model.train()
+    metrics_tracker.reset()
+    
+    pbar = tqdm(train_loader, desc="Training", ncols=140)
+    
+    for batch_idx, (hist_neighbors, future, _, _, exp_goals, all_futures) in enumerate(pbar):
+        hist_neighbors = hist_neighbors.to(device)
+        exp_goals = exp_goals.to(device)
+        all_futures = all_futures.to(device)
+        
+        optimizer.zero_grad()
+        adjusted_preds, decoded_preds, coeff_mean, coeff_var = model(
+            hist_neighbors, exp_goals
+        )
+        
+        loss, loss_dict = position_loss(adjusted_preds, decoded_preds, all_futures, config)
+        
+        loss.backward()
+        
+        # Gradient clipping (critical for CfC stability)
+        if config['gradient_clip'] > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                config['gradient_clip']
+            )
+        else:
+            grad_norm = 0.0
+        
+        optimizer.step()
+        
+        metrics_tracker.update(
+            loss.item(),
+            position_loss=loss_dict['adjusted_loss'],
+            coeff_reg=coeff_var.item()
+        )
+        
+        pbar.set_postfix({
+            'loss': f"{loss.item():.6f}",
+            'adj_loss': f"{loss_dict['adjusted_loss']:.6f}",
+            'dec_loss': f"{loss_dict['decoded_loss']:.6f}",
+            'coeff_var': f"{coeff_var.item():.6e}",
+            'lr': f"{optimizer.param_groups[0]['lr']:.6e}",
+            'grad_norm': f"{grad_norm:.3f}" if grad_norm > 0 else "N/A"
+        })
+    
+    return metrics_tracker.get_average_loss()
+
+
+def validate(model, val_loader, device, config):
+    """Validate model on validation set."""
+    model.eval()
+    metrics_tracker = MetricsTracker()
+    
+    ade_tracker = []
+    fde_tracker = []
+    
+    with torch.no_grad():
+        pbar = tqdm(val_loader, desc="Validation", ncols=140)
+        
+        for hist_neighbors, future, _, _, exp_goals, all_futures in pbar:
+            hist_neighbors = hist_neighbors.to(device)
+            exp_goals = exp_goals.to(device)
+            all_futures = all_futures.to(device)
+            
+            adjusted_preds, decoded_preds, coeff_mean, coeff_var = model(
+                hist_neighbors, exp_goals
+            )
+            
+            loss, loss_dict = position_loss(adjusted_preds, decoded_preds, all_futures, config)
+            
+            ade = compute_ade(adjusted_preds, all_futures)
+            fde = compute_fde(adjusted_preds, all_futures)
+            
+            ade_tracker.append(ade.item())
+            fde_tracker.append(fde.item())
+            
+            metrics_tracker.update(
+                loss.item(),
+                position_loss=loss_dict['adjusted_loss'],
+                coeff_reg=coeff_var.item()
+            )
+            
+            pbar.set_postfix({
+                'val_loss': f"{loss.item():.6f}",
+                'ade': f"{ade.item():.6f}",
+                'fde': f"{fde.item():.6f}",
+                'coeff_var': f"{coeff_var.item():.6e}"
+            })
+    
+    avg_loss = metrics_tracker.get_average_loss()
+    loss_std = metrics_tracker.get_loss_std()
+    avg_ade = np.mean(ade_tracker)
+    avg_fde = np.mean(fde_tracker)
+    
+    metrics = {
+        'val_loss': avg_loss,
+        'val_loss_std': loss_std,
+        'val_ade': avg_ade,
+        'val_fde': avg_fde,
+        'num_batches': metrics_tracker.num_batches
+    }
+    
+    return avg_loss, metrics
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_loss,
+                   best_val_loss, config, filepath, is_best=False):
+    """Save model checkpoint."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'best_val_loss': best_val_loss,
+        'config': config,
+        'timestamp': datetime.now().isoformat(),
+        'model_type': 'CFC_PFM_Hybrid'
+    }
+    
+    torch.save(checkpoint, filepath)
+    
+    if is_best:
+        best_path = os.path.join(
+            os.path.dirname(filepath),
+            "best_cfc_pfm_model.pth"
+        )
+        torch.save(checkpoint, best_path)
+        print(f"  ✓ Saved best model to {best_path}")
+
+
+def log_training_info(config, log_dir):
+    """Log training configuration and system info."""
+    log_path = os.path.join(log_dir, 'training_config.json')
+    
+    info = {
+        'config': config,
+        'timestamp': datetime.now().isoformat(),
+        'pytorch_version': torch.__version__,
+        'cuda_available': torch.cuda.is_available(),
+        'device': str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else 'CPU',
+        'model_type': 'CFC_PFM_Hybrid (Closed-Form Continuous-Time)'
+    }
+    
+    with open(log_path, 'w') as f:
+        json.dump(info, f, indent=4)
+    
+    print("\n" + "="*100)
+    print("CFC-PFM HYBRID MODEL TRAINING (CLOSED-FORM SOLUTION)")
+    print("="*100)
+    for key, value in config.items():
+        print(f"{key:35s}: {value}")
+    print("="*100 + "\n")
+
+
+def train_cfc_pfm_model():
+    """
+    Main training function for CfC-PFM Hybrid Model.
+    
+    Uses the Closed-Form Continuous-Time (CfC) implementation with 
+    Physics-Informed Potential Fields for faster training.
+    """
+    
+    # ========================================================================
+    # CONFIGURATION
+    # ========================================================================
+    CONFIG = {
+        # Data paths
+        'data_path': 'data/combined_annotations.csv',
+        'checkpoint_dir': 'checkpoints/cfc_pfm',
+        'log_dir': 'logs/cfc_pfm',
+        
+        # Data split
+        'train_split': 0.8,
+        'random_seed': 42,
+        
+        # ====================================================================
+        # CfC ENCODER/DECODER PARAMETERS (TWEAKABLE)
+        # ====================================================================
+        'hidden_size': 64,              # CfC hidden units
+        'cfc_mode': 'default',          # CfC mode: "default", "pure", "no_gate"
+        'cfc_backbone_units': 128,      # Backbone MLP units
+        'cfc_backbone_layers': 1,       # Backbone MLP layers
+        'cfc_backbone_activation': 'lecun_tanh',  # Activation: lecun_tanh, relu, gelu
+        'cfc_backbone_dropout': 0.1,    # Dropout in backbone
+        'mixed_memory': True,           # Augment with LSTM cell
+        
+        # ====================================================================
+        # MODEL PARAMETERS
+        # ====================================================================
+        'dt': 0.1,                      # Integration timestep (seconds)
+        'target_avg_speed': 4.087,      # Average speed
+        'speed_tolerance': 0.15,        # Speed clamping tolerance
+        'use_angular_velocity': True,   # Enable (Δv, Δω) mode
+        'num_agents': 1000,             # Max agents for embedding
+        
+        # ====================================================================
+        # DATASET PARAMETERS
+        # ====================================================================
+        'history_len': 8,               # History length (timesteps)
+        'prediction_len': 12,           # Prediction length (timesteps)
+        'max_neighbors': 12,            # Max neighbors per agent
+        
+        # ====================================================================
+        # TRAINING HYPERPARAMETERS
+        # ====================================================================
+        'batch_size': 8,                # Batch size (reduce if CUDA OOM)
+        'learning_rate': 1e-4,          # Initial learning rate (CfC is sensitive)
+        'num_epochs': 100,              # Max epochs
+        'gradient_clip': 1.0,           # Gradient clipping threshold
+        'loss_alpha': 0.8,              # Weight for adjusted vs decoded predictions
+        
+        # ====================================================================
+        # LEARNING RATE SCHEDULING
+        # ====================================================================
+        'use_scheduler': True,
+        'scheduler_type': 'plateau',    # 'plateau' or 'cosine'
+        'scheduler_patience': 7,        # ReduceLROnPlateau patience
+        'scheduler_factor': 0.5,        # LR reduction factor
+        'scheduler_min_lr': 1e-7,       # Minimum learning rate
+        'scheduler_warmup_epochs': 0,   # Warmup epochs (0 = no warmup)
+        
+        # ====================================================================
+        # EARLY STOPPING
+        # ====================================================================
+        'use_early_stopping': True,
+        'early_stopping_patience': 15,
+        'early_stopping_min_delta': 1e-4,
+        
+        # ====================================================================
+        # CHECKPOINTING
+        # ====================================================================
+        'save_best_only': False,
+        'save_interval': 5,
+        
+        # ====================================================================
+        # DATALOADER
+        # ====================================================================
+        'num_workers': 2,
+        'pin_memory': True,
+        'persistent_workers': False,
+    }
+    
+    # ========================================================================
+    # SETUP
+    # ========================================================================
+    os.makedirs(CONFIG['checkpoint_dir'], exist_ok=True)
+    os.makedirs(CONFIG['log_dir'], exist_ok=True)
+    
+    # Data path auto-detection
+    possible_paths = [
+        CONFIG['data_path'],
+        '/content/combined_annotations.csv',
+        'combined_annotations.csv',
+        'data/crowds_zara02_test_cleaned.txt',
+        '../data/combined_annotations.csv',
+    ]
+    
+    data_path_found = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            data_path_found = path
+            print(f"✓ Found data file: {path}")
+            break
+    
+    if data_path_found is None:
+        error_msg = f"ERROR: Could not find data file!\nTried paths:\n"
+        for path in possible_paths:
+            error_msg += f"  - {path}\n"
+        raise FileNotFoundError(error_msg)
+    
+    CONFIG['data_path'] = data_path_found
+    
+    log_training_info(CONFIG, CONFIG['log_dir'])
+    
+    # Set random seed
+    torch.manual_seed(CONFIG['random_seed'])
+    np.random.seed(CONFIG['random_seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(CONFIG['random_seed'])
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n{'Device':<40}: {device}")
+    if torch.cuda.is_available():
+        print(f"{'GPU':<40}: {torch.cuda.get_device_name(0)}")
+        print(f"{'GPU Memory':<40}: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB\n")
+    
+    # ========================================================================
+    # DATA LOADING
+    # ========================================================================
+    print("="*100)
+    print("LOADING DATASET")
+    print("="*100)
+    
+    dataset = PFM_TrajectoryDataset_neighbours(
+        file_path=CONFIG['data_path'],
+        history_len=CONFIG['history_len'],
+        prediction_len=CONFIG['prediction_len'],
+        max_neighbors=CONFIG['max_neighbors']
+    )
+    
+    print(f"Total samples: {len(dataset)}")
+    
+    train_size = int(CONFIG['train_split'] * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(CONFIG['random_seed'])
+    )
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=CONFIG['num_workers'],
+        pin_memory=CONFIG['pin_memory'],
+        persistent_workers=CONFIG['persistent_workers']
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=CONFIG['num_workers'],
+        pin_memory=CONFIG['pin_memory'],
+        persistent_workers=CONFIG['persistent_workers']
+    )
+    
+    # ========================================================================
+    # MODEL INITIALIZATION
+    # ========================================================================
+    print("\n" + "="*100)
+    print("INITIALIZING CFC-PFM MODEL (CLOSED-FORM)")
+    print("="*100)
+    
+    model = CFC_PFM_HybridModel(
+        input_size=2,
+        hidden_size=CONFIG['hidden_size'],
+        num_layers=1,
+        target_avg_speed=CONFIG['target_avg_speed'],
+        speed_tolerance=CONFIG['speed_tolerance'],
+        num_agents=CONFIG['num_agents'],
+        dt=CONFIG['dt'],
+        # CfC parameters (TWEAKABLE)
+        cfc_mode=CONFIG['cfc_mode'],
+        cfc_backbone_units=CONFIG['cfc_backbone_units'],
+        cfc_backbone_layers=CONFIG['cfc_backbone_layers'],
+        cfc_backbone_activation=CONFIG['cfc_backbone_activation'],
+        cfc_backbone_dropout=CONFIG['cfc_backbone_dropout'],
+        mixed_memory=CONFIG['mixed_memory'],
+        use_angular_velocity=CONFIG['use_angular_velocity']
+    )
+    
+    model = model.to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"{'Model':<40}: CFC_PFM_HybridModel (Closed-Form)")
+    print(f"{'Total parameters':<40}: {total_params:,}")
+    print(f"{'Trainable parameters':<40}: {trainable_params:,}")
+    print(f"{'CfC Mode':<40}: {CONFIG['cfc_mode']}")
+    print(f"{'Hidden Size':<40}: {CONFIG['hidden_size']}")
+    print(f"{'Backbone Units':<40}: {CONFIG['cfc_backbone_units']}")
+    print(f"{'Backbone Activation':<40}: {CONFIG['cfc_backbone_activation']}")
+    print(f"{'Mixed Memory (LSTM)':<40}: {CONFIG['mixed_memory']}")
+    
+    # ========================================================================
+    # OPTIMIZER AND SCHEDULER
+    # ========================================================================
+    print("\n" + "="*100)
+    print("OPTIMIZER CONFIGURATION")
+    print("="*100)
+    
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=CONFIG['learning_rate'],
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-5
+    )
+    
+    scheduler = None
+    if CONFIG['use_scheduler']:
+        if CONFIG['scheduler_type'] == 'plateau':
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=CONFIG['scheduler_factor'],
+                patience=CONFIG['scheduler_patience'],
+                min_lr=CONFIG['scheduler_min_lr'],
+                verbose=True
+            )
+        elif CONFIG['scheduler_type'] == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=CONFIG['num_epochs'],
+                eta_min=CONFIG['scheduler_min_lr']
+            )
+    
+    print(f"{'Optimizer':<40}: Adam")
+    print(f"{'Learning Rate':<40}: {CONFIG['learning_rate']:.6e}")
+    print(f"{'Gradient Clipping':<40}: {CONFIG['gradient_clip']}")
+    print(f"{'Use Scheduler':<40}: {CONFIG['use_scheduler']}")
+    if CONFIG['use_scheduler']:
+        print(f"{'Scheduler Type':<40}: {CONFIG['scheduler_type']}")
+    
+    # Early stopping
+    early_stopping = None
+    if CONFIG['use_early_stopping']:
+        early_stopping = EarlyStopping(
+            patience=CONFIG['early_stopping_patience'],
+            min_delta=CONFIG['early_stopping_min_delta'],
+            verbose=True
+        )
+    
+    # ========================================================================
+    # TRAINING LOOP
+    # ========================================================================
+    print("\n" + "="*100)
+    print("TRAINING")
+    print("="*100 + "\n")
+    
+    best_val_loss = float('inf')
+    start_time = time.time()
+    
+    training_history = {
+        'epoch': [],
+        'train_loss': [],
+        'val_loss': [],
+        'val_ade': [],
+        'val_fde': [],
+        'learning_rate': []
+    }
+    
+    for epoch in range(CONFIG['num_epochs']):
+        epoch_start = time.time()
+        
+        print(f"\nEpoch {epoch + 1}/{CONFIG['num_epochs']}")
+        print("-" * 100)
+        
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device, CONFIG, MetricsTracker()
+        )
+        
+        val_loss, val_metrics = validate(model, val_loader, device, CONFIG)
+        
+        epoch_time = time.time() - epoch_start
+        
+        if scheduler is not None:
+            if CONFIG['scheduler_type'] == 'plateau':
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+        
+        if early_stopping is not None:
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                print("\n[Training] Early stopping triggered!")
+                break
+        
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+        
+        if (epoch + 1) % CONFIG['save_interval'] == 0 or is_best:
+            checkpoint_path = os.path.join(
+                CONFIG['checkpoint_dir'],
+                f"cfc_pfm_epoch_{epoch + 1}.pth"
+            )
+            save_checkpoint(
+                model, optimizer, scheduler, epoch + 1, train_loss, val_loss,
+                best_val_loss, CONFIG, checkpoint_path, is_best=is_best
+            )
+        
+        training_history['epoch'].append(epoch + 1)
+        training_history['train_loss'].append(train_loss)
+        training_history['val_loss'].append(val_loss)
+        training_history['val_ade'].append(val_metrics['val_ade'])
+        training_history['val_fde'].append(val_metrics['val_fde'])
+        training_history['learning_rate'].append(optimizer.param_groups[0]['lr'])
+        
+        print(f"\n  Train Loss: {train_loss:.6f}")
+        print(f"  Val Loss:   {val_loss:.6f} (best: {best_val_loss:.6f})")
+        print(f"  Val ADE:    {val_metrics['val_ade']:.6f}")
+        print(f"  Val FDE:    {val_metrics['val_fde']:.6f}")
+        print(f"  LR:         {optimizer.param_groups[0]['lr']:.6e}")
+        print(f"  Time:       {epoch_time:.1f}s")
+    
+    # ========================================================================
+    # TRAINING COMPLETED
+    # ========================================================================
+    total_time = time.time() - start_time
+    
+    print("\n" + "="*100)
+    print("TRAINING COMPLETED")
+    print("="*100)
+    print(f"Total time: {total_time / 3600:.2f} hours")
+    print(f"Best validation loss: {best_val_loss:.6f}")
+    print(f"Checkpoint directory: {CONFIG['checkpoint_dir']}")
+    
+    history_path = os.path.join(CONFIG['log_dir'], 'training_history.json')
+    with open(history_path, 'w') as f:
+        json.dump(training_history, f, indent=4)
+    
+    print(f"Training history saved to: {history_path}")
+    
+    return model, CONFIG, training_history
+
+
+if __name__ == "__main__":
+    model, config, history = train_cfc_pfm_model()
+    print("\n✓ CFC-PFM Training complete!")
